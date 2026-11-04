@@ -1,0 +1,5 @@
+# Your client list and reports stay on your machine
+domains.csv
+reports/
+*.tmp
+.DS_Store

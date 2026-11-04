@@ -1,0 +1,40 @@
+name: test
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'   # weekly, to notice when a public test host changes
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Script is plain ASCII (Windows PowerShell 5.1 misreads UTF-8 without a BOM)
+        shell: pwsh
+        run: if (Select-String -Path ./Test-ClientDomains.ps1 -Pattern '[^\x00-\x7F]') { throw 'non-ASCII character found' }
+      - name: Offline tests - Windows PowerShell 5.1
+        shell: powershell
+        run: .\tests\Run-Tests.ps1
+      - name: Offline tests - PowerShell 7
+        shell: pwsh
+        run: ./tests/Run-Tests.ps1
+      - name: Live test - Windows PowerShell 5.1
+        shell: powershell
+        run: .\tests\Live-Tests.ps1
+      - name: Live test - PowerShell 7
+        shell: pwsh
+        run: ./tests/Live-Tests.ps1
+      - name: Task Scheduler setup from the README
+        shell: powershell
+        run: .\tests\Test-ScheduledTask.ps1
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Offline tests - PowerShell 7
+        shell: pwsh
+        run: ./tests/Run-Tests.ps1
+      - name: Live test - PowerShell 7
+        shell: pwsh
+        run: ./tests/Live-Tests.ps1

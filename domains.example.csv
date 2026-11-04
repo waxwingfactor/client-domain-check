@@ -1,0 +1,4 @@
+Client,Domain,CertHosts
+Contoso,contoso.com,remote.contoso.com; vpn.contoso.com:4443
+Fabrikam,fabrikam.com,
+Northwind Traders,northwindtraders.com,mail.northwindtraders.com
