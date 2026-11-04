@@ -118,7 +118,8 @@ function Get-DaysLeft {
 
 function Format-DaysCell {
     param($Days)
-    if ($null -eq $Days) { return '-' }
+    if ($null -eq $Days -or '' -eq $Days) { return '-' }
+    $Days = [int]$Days   # Windows PowerShell 5.1 can pass "-5" as a string
     if ($Days -lt 0) { return 'expired' }
     if ($Days -eq 1) { return '1 day' }
     "$Days days"
@@ -1085,7 +1086,8 @@ function ConvertTo-Html5 {
 
 function Get-DayClass {
     param($Days, [int]$Warn, [int]$Critical)
-    if ($null -eq $Days) { return '' }
+    if ($null -eq $Days -or '' -eq $Days) { return '' }
+    $Days = [int]$Days
     if ($Days -le $Critical) { return 'bad' }
     if ($Days -le $Warn) { return 'warn' }
     ''

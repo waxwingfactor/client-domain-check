@@ -71,6 +71,8 @@ Assert-Equal 'expires in 1 day' (Format-DaysPhrase 1) 'Days phrase: singular'
 Assert-Equal 'expired 3 days ago' (Format-DaysPhrase -3) 'Days phrase: past'
 Assert-Equal 'expired' (Format-DaysCell -4224) 'Days cell: expired'
 Assert-Equal '1 day' (Format-DaysCell 1) 'Days cell: singular'
+Assert-Equal 'bad' (Get-DayClass -3 14 7) 'Day class: negative is critical'
+Assert-Equal '-' (Format-DaysCell $null) 'Days cell: unknown'
 Assert-Equal 2027 (ConvertTo-UtcDate '2027-02-06T23:15:14Z').Year 'Date: RDAP date parses'
 Assert-Equal 23 (ConvertTo-UtcDate '2027-02-06T23:15:14Z').Hour 'Date: RDAP date stays in UTC'
 
