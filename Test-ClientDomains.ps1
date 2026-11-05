@@ -89,6 +89,7 @@ $script:RdapBootstrap = $null
 $script:RdapBootstrapError = $null
 $script:Http = $null
 $script:TlsProtocols = $null
+$script:TlsRetryDelayMs = 2000
 
 # ---------------------------------------------------------------- helpers
 
@@ -498,6 +499,18 @@ function Get-Registration {
 # ---------------------------------------------------------------- TLS certificates
 
 function Get-TlsCertificateInfo {
+    # A dropped connection (reset or closed mid-handshake) is retried once, so a momentary
+    # blip doesn't become a "couldn't connect" warning. Refusals and timeouts are not retried.
+    param([string]$HostName, [int]$Port = 443, [int]$TimeoutMs = 8000)
+    $info = Get-TlsCertificateOnce -HostName $HostName -Port $Port -TimeoutMs $TimeoutMs
+    if (-not $info.Connected -and $info.Error -match 'reset|forcibly closed|closed the transport stream|transport connection|aborted|unexpected EOF') {
+        Start-Sleep -Milliseconds $script:TlsRetryDelayMs
+        $info = Get-TlsCertificateOnce -HostName $HostName -Port $Port -TimeoutMs $TimeoutMs
+    }
+    $info
+}
+
+function Get-TlsCertificateOnce {
     param([string]$HostName, [int]$Port = 443, [int]$TimeoutMs = 8000)
     $info = [pscustomobject]@{
         Host = $HostName; Port = $Port; Connected = $false; Error = $null
@@ -657,7 +670,9 @@ function Invoke-SpfWalk {
     param([string]$DomainName, $Ctx, [string[]]$Path, [bool]$IsPolicyRoot)
     $key = $DomainName.ToLowerInvariant()
     if ($Path -contains $key) { $Ctx.Problems.Add("SPF include loop: $DomainName includes itself") | Out-Null; return 'ok' }
-    if ($Path.Count -ge 10) { $Ctx.Problems.Add("SPF includes are nested more than 10 levels deep at $DomainName") | Out-Null; return 'ok' }
+    # Ten nested includes is exactly the RFC limit and still valid; anything deeper is already
+    # over 10 lookups and reported by the count. This only stops pathological chains.
+    if ($Path.Count -ge 30) { return 'ok' }
 
     $query = Resolve-Doh -Name $DomainName -Type 'TXT'
     if (-not $query.Ok) { $Ctx.Incomplete.Add($DomainName) | Out-Null; return 'error' }
@@ -786,6 +801,12 @@ function Test-OneDomain {
     elseif ($reg.Error) {
         $row.RegistrationNote = 'lookup failed'
         $findings.Add((New-Finding 'Warning' 'Domain' "Couldn't check registration: $($reg.Error)")) | Out-Null
+    }
+    elseif ($reg.Found -eq $false -and $ns.Ok -and $ns.Status -eq 0 -and $ns.Records.Count -gt 0) {
+        # Live in DNS but unknown to the TLD's RDAP server: a name under a separately run
+        # registry such as .ac.uk, so this says nothing about whether it is about to lapse.
+        $row.RegistrationNote = 'not in registry RDAP'
+        $findings.Add((New-Finding 'Info' 'Domain' "The .$(($d -split '\.')[-1]) registry's RDAP server has no record of this name, although it is live in DNS. Names like this (for example under .ac.uk) are run by a separate registry; check the expiry date with whoever registered it.")) | Out-Null
     }
     elseif ($reg.Found -eq $false) {
         $row.RegistrationNote = 'not registered'

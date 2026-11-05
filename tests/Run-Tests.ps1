@@ -418,6 +418,50 @@ try {
     Assert-True ($slack.text -match '^\*Client domain check: 0 critical, 1 warning') 'Slack: title'
     Assert-True ($slack.text -match ':large_yellow_circle: Beta LLC \(beta.test\): SPF record changed') 'Slack: finding line'
 
+    # ---------------------------------------------------------------- found in scale testing
+    # A chain of 10 nested includes is exactly at the limit and valid (ninjaone.com does this).
+    New-FakeDomain 'chain10.test'
+    Set-Dns 'chain10.test' 'TXT' @('v=spf1 include:c0.chain10.test ~all')
+    for ($n = 0; $n -le 9; $n++) {
+        $next = if ($n -lt 9) { " include:c$($n + 1).chain10.test" } else { '' }
+        Set-Dns "c$n.chain10.test" 'TXT' @("v=spf1 ip4:192.0.2.$n$next ~all")
+    }
+    $r = Test-OneDomain -Entry (New-Entry 'chain10.test') -Previous $null
+    Assert-Equal 10 $r.SpfLookups 'SPF: 10 nested includes count as 10 lookups'
+    Assert-True ((Get-Levels $r 'SPF') -notcontains 'Critical') 'SPF: 10 nested includes are not critical'
+    Set-Dns 'c9.chain10.test' 'TXT' @('v=spf1 ip4:192.0.2.9 include:c10.chain10.test ~all')
+    Set-Dns 'c10.chain10.test' 'TXT' @('v=spf1 ip4:192.0.2.10 ~all')
+    $r = Test-OneDomain -Entry (New-Entry 'chain10.test') -Previous $null
+    Assert-Equal 11 $r.SpfLookups 'SPF: 11 nested includes count as 11'
+    Assert-True ((Get-Levels $r 'SPF') -contains 'Critical') 'SPF: 11 nested includes are critical'
+
+    # A dropped TLS connection is retried once; refusals and timeouts are not.
+    $script:TlsAttempts = @{}
+    $script:FakeCerts['blip.test:443'] = @((New-FakeCert -HostName 'blip.test' -ConnectError 'Connection reset by peer'), (New-FakeCert -HostName 'blip.test' -Days 60))
+    $c = Get-TlsCertificateInfo -HostName 'blip.test'
+    Assert-True ($c.Connected -and $script:TlsAttempts['blip.test:443'] -eq 2) 'TLS: connection reset is retried once and succeeds'
+    $script:FakeCerts['reset.test:443'] = New-FakeCert -HostName 'reset.test' -ConnectError 'An existing connection was forcibly closed by the remote host.'
+    $c = Get-TlsCertificateInfo -HostName 'reset.test'
+    Assert-True (-not $c.Connected -and $script:TlsAttempts['reset.test:443'] -eq 2) 'TLS: persistent reset is reported after one retry'
+    $script:FakeCerts['refused.test:443'] = New-FakeCert -HostName 'refused.test' -ConnectError 'Connection refused'
+    $c = Get-TlsCertificateInfo -HostName 'refused.test'
+    Assert-Equal 1 $script:TlsAttempts['refused.test:443'] 'TLS: refused connection is not retried'
+    $script:FakeCerts['slow.test:443'] = New-FakeCert -HostName 'slow.test' -ConnectError 'timed out'
+    $c = Get-TlsCertificateInfo -HostName 'slow.test'
+    Assert-Equal 1 $script:TlsAttempts['slow.test:443'] 'TLS: timeout is not retried'
+
+    # Registry RDAP says 404 but DNS shows the domain is live (ox.ac.uk): a note, not critical.
+    New-FakeDomain 'ox.ac.uk'
+    $script:FakeRegistration['ox.ac.uk'] = [pscustomobject]@{ Supported = $true; Found = $false; Expires = $null; Registrar = $null; Statuses = @(); Error = $null }
+    $r = Test-OneDomain -Entry (New-Entry 'ox.ac.uk') -Previous $null
+    Assert-Equal 'OK' $r.Status 'RDAP 404 on a live domain is not critical'
+    Assert-Equal 'not in registry RDAP' $r.RegistrationNote 'RDAP 404 on a live domain is noted'
+    Set-Dns 'gone.test' 'NS' @() -Status 3
+    $script:FakeRegistration['gone.test'] = [pscustomobject]@{ Supported = $true; Found = $false; Expires = $null; Registrar = $null; Statuses = @(); Error = $null }
+    $r = Test-OneDomain -Entry (New-Entry 'gone.test') -Previous $null
+    Assert-Equal 'not registered' $r.RegistrationNote 'RDAP 404 plus NXDOMAIN is still not registered'
+    Assert-True ((Get-Levels $r 'Domain') -contains 'Critical') 'RDAP 404 plus NXDOMAIN is still critical'
+
     # ---------------------------------------------------------------- DNS over HTTPS fallback
     $blocked = [pscustomobject]@{ StatusCode = 0; Body = $null; Error = 'No such host is known.' }
     $blockPage = [pscustomobject]@{ StatusCode = 200; Body = '<html><body>Blocked by your DNS filter</body></html>'; Error = $null }

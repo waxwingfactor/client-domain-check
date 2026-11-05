@@ -60,10 +60,18 @@ function Get-Registration {
 }
 
 $script:FakeCerts = @{}
-function Get-TlsCertificateInfo {
+$script:TlsRetryDelayMs = 0
+$script:TlsAttempts = @{}
+function Get-TlsCertificateOnce {
+    # Replaces the single TLS handshake; the retry wrapper above it stays real.
+    # A FakeCerts entry may be an array: one result per attempt.
     param([string]$HostName, [int]$Port = 443, [int]$TimeoutMs = 8000)
     $key = "${HostName}:$Port"
-    if ($script:FakeCerts.ContainsKey($key)) { return $script:FakeCerts[$key] }
+    $script:TlsAttempts[$key] = 1 + [int]$script:TlsAttempts[$key]
+    if ($script:FakeCerts.ContainsKey($key)) {
+        $fake = @($script:FakeCerts[$key])
+        return $fake[[Math]::Min($script:TlsAttempts[$key], $fake.Count) - 1]
+    }
     New-FakeCert -HostName $HostName -Port $Port -Days 60
 }
 function New-FakeCert {

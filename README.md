@@ -41,7 +41,7 @@ You get an HTML report (problems first), a CSV for your PSA or spreadsheet, and 
 
 The report and CSV go into a `reports` folder next to the script, along with a small state file used to spot changes between runs. To check a couple of domains without a file: `.\Test-ClientDomains.ps1 -Domain contoso.com, fabrikam.com -Open`.
 
-A list of 100 domains takes a few minutes. The checks run one at a time to stay polite to the registries.
+The checks run one at a time to stay polite to the registries. In testing, 100 public domains took about 1.5 minutes on Windows PowerShell 5.1 and 2 minutes on a Mac, with no rate limiting from any registry (`tests/Scale-Test.ps1`).
 
 ## Run it every morning
 
@@ -93,7 +93,7 @@ Pass `-WebhookUrl`. A summary is posted only when something needs attention; add
 ## Limits worth knowing
 
 - **Network access:** the machine needs outbound HTTPS to `cloudflare-dns.com` or `dns.google`, to `data.iana.org` and the registries' RDAP servers, and to the hosts it checks. DNS filters (Umbrella, DNSFilter and the like) often block encrypted DNS. If both resolvers are blocked, the script stops with exit code `3` and says what to allow. Web lookups follow the system proxy settings, but certificate checks connect directly, and proxies that require a login aren't supported.
-- **Registration data:** some country registries, including `.de`, don't publish expiry dates over RDAP. The report says so instead of guessing. For gTLDs like `.com`, the date is the *registry's*; the auto-renew grace check covers the case where it rolled forward without payment.
+- **Registration data:** some country registries, including `.de`, don't publish expiry dates over RDAP, and names under separately run registries such as `.ac.uk` aren't in the main registry's data. The report says so instead of guessing. For gTLDs like `.com`, the date is the *registry's*; the auto-renew grace check covers the case where it rolled forward without payment.
 - **DKIM selectors can be named anything,** so "not found at common selectors" is a note, not a warning. The Microsoft 365 check is the exception, because Microsoft always uses `selector1`/`selector2`.
 - **SPF:** lookups are counted per RFC 7208, through nested includes. Terms with macros (such as Salesforce's `exists:%{i}...`) are counted but can't be followed, so includes behind them aren't seen.
 - It checks the website at the domain or `www.`, not every subdomain. Put anything else in `CertHosts`.
@@ -105,7 +105,7 @@ Pass `-WebhookUrl`. A summary is posted only when something needs attention; add
 .\tests\Live-Tests.ps1     # live: real lookups against hosts with known properties (e.g. expired.badssl.com)
 ```
 
-GitHub Actions runs both on Windows PowerShell 5.1, PowerShell 7 on Windows and PowerShell 7 on Linux, and tests the Task Scheduler steps above on a Windows runner.
+GitHub Actions runs both on Windows PowerShell 5.1, PowerShell 7 on Windows and PowerShell 7 on Linux, and tests the Task Scheduler steps above on a Windows runner. A manual `scale` workflow times a run over 100 public domains (`tests/Scale-Test.ps1`).
 
 ## License
 
