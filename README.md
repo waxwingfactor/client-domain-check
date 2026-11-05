@@ -19,7 +19,7 @@ One file, read-only, no modules, no API keys, no agent. Runs in Windows PowerShe
 | **DKIM** | Looks for keys at common selectors, and specifically catches Microsoft 365 domains where DKIM was never enabled. |
 | **Changes** | Nameservers, MX, SPF, DMARC or registrar changed since the last run: the web designer who "fixed" DNS, or a migration nobody told you about. Alerts once, then the new value becomes the baseline. |
 
-You get an HTML report (problems first), a CSV for your PSA or spreadsheet, and optionally a summary in Teams or Slack. The exit code is `0` all clear, `1` warnings, `2` critical, so an RMM or Task Scheduler can alert on it.
+You get an HTML report (problems first), a CSV for your PSA or spreadsheet, and optionally a summary in Teams or Slack. The exit code is `0` all clear, `1` warnings, `2` critical, so an RMM or Task Scheduler can alert on it. `3` means the check couldn't run at all, for example because the network blocks encrypted DNS; that is posted to Teams or Slack too, so a scheduled run never fails silently.
 
 ## Quick start
 
@@ -80,18 +80,19 @@ Pass `-WebhookUrl`. A summary is posted only when something needs attention; add
 | `-DomainWarnDays`, `-DomainCriticalDays` | 30, 7 | Registration thresholds |
 | `-CertWarnDays`, `-CertCriticalDays` | 14, 7 | Certificate thresholds. Certificates that last 30 days or less, such as 6-day certificates, are only flagged when renewal has stalled |
 | `-DkimSelectors` | `selector1, selector2, google, default, k1, s1, s2` | Add your own selectors |
-| `-DnsResolver` | `Cloudflare` | `Cloudflare` or `Google` DNS over HTTPS |
+| `-DnsResolver` | `Cloudflare` | `Cloudflare` or `Google` DNS over HTTPS. If it can't be reached, the other one is used and the report says so |
 | `-Open`, `-PassThru` | | Open the report; output result objects for your own scripting |
 
 ## Is it safe to run?
 
 - **Read-only.** It reads public DNS records, public registry data and the certificate a website presents. It never logs in to anything, changes anything, or needs credentials.
-- **Where your list goes:** domain names are sent to the DNS-over-HTTPS resolver you pick (Cloudflare or Google) and to each domain's registry RDAP server; the script connects to each website and host you list on its HTTPS port. Nothing else, and no telemetry.
+- **Where your list goes:** domain names are sent to the DNS-over-HTTPS resolver you pick (Cloudflare or Google, and the other one only if yours can't be reached) and to each domain's registry RDAP server; the script connects to each website and host you list on its HTTPS port. Nothing else, and no telemetry.
 - **Nothing compiled or downloaded at runtime.** It's a single readable `.ps1` with no modules and no `Add-Type` C# compilation, a behavior EDR tools often flag.
 - Public DNS is used on purpose, so internal split-DNS answers don't hide what the internet sees. Certificate checks connect through the machine's normal network, so internal hosts in `CertHosts` work if that machine can reach them.
 
 ## Limits worth knowing
 
+- **Network access:** the machine needs outbound HTTPS to `cloudflare-dns.com` or `dns.google`, to `data.iana.org` and the registries' RDAP servers, and to the hosts it checks. DNS filters (Umbrella, DNSFilter and the like) often block encrypted DNS. If both resolvers are blocked, the script stops with exit code `3` and says what to allow. Web lookups follow the system proxy settings, but certificate checks connect directly, and proxies that require a login aren't supported.
 - **Registration data:** some country registries, including `.de`, don't publish expiry dates over RDAP. The report says so instead of guessing. For gTLDs like `.com`, the date is the *registry's*; the auto-renew grace check covers the case where it rolled forward without payment.
 - **DKIM selectors can be named anything,** so "not found at common selectors" is a note, not a warning. The Microsoft 365 check is the exception, because Microsoft always uses `selector1`/`selector2`.
 - **SPF:** lookups are counted per RFC 7208, through nested includes. Terms with macros (such as Salesforce's `exists:%{i}...`) are counted but can't be followed, so includes behind them aren't seen.

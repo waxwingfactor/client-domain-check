@@ -1,0 +1,21 @@
+name: scale
+# Manual only: times a real run over 100 public domains on Windows PowerShell 5.1
+# and reports retries and failed lookups (registry rate limits).
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-ps51:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: 100 domains, Windows PowerShell 5.1
+        shell: powershell
+        run: .\tests\Scale-Test.ps1 -Destination "$env:RUNNER_TEMP\scale"
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: scale-report
+          path: ${{ runner.temp }}/scale

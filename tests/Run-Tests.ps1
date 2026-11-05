@@ -417,6 +417,96 @@ try {
     $slack = New-WebhookPayload -Url 'https://hooks.slack.com/services/T/B/X' -Results $run.Results -ReportPath 'C:\r.html' | ConvertFrom-Json
     Assert-True ($slack.text -match '^\*Client domain check: 0 critical, 1 warning') 'Slack: title'
     Assert-True ($slack.text -match ':large_yellow_circle: Beta LLC \(beta.test\): SPF record changed') 'Slack: finding line'
+
+    # ---------------------------------------------------------------- DNS over HTTPS fallback
+    $blocked = [pscustomobject]@{ StatusCode = 0; Body = $null; Error = 'No such host is known.' }
+    $blockPage = [pscustomobject]@{ StatusCode = 200; Body = '<html><body>Blocked by your DNS filter</body></html>'; Error = $null }
+
+    Reset-FakeHttp
+    $sel = Select-DnsResolver -Preferred 'Cloudflare'
+    Assert-True ($sel.Ok -and $sel.Resolver -eq 'Cloudflare' -and -not $sel.Note) 'DoH: preferred resolver used when it answers'
+    $sel = Select-DnsResolver -Preferred 'Google'
+    Assert-Equal 'Google' $sel.Resolver 'DoH: -DnsResolver Google is respected'
+
+    Reset-FakeHttp
+    $script:FakeHttp['cloudflare-dns.com'] = $blocked
+    $sel = Select-DnsResolver -Preferred 'Cloudflare'
+    Assert-True ($sel.Ok -and $sel.Resolver -eq 'Google') 'DoH: falls back to Google when Cloudflare is blocked'
+    Assert-True ($sel.Note -match 'cloudflare-dns\.com' -and $sel.Note -match 'No such host') 'DoH: fallback note names the blocked host and the error'
+
+    Reset-FakeHttp
+    $script:FakeHttp['cloudflare-dns.com'] = $blockPage
+    $sel = Select-DnsResolver -Preferred 'Cloudflare'
+    Assert-Equal 'Google' $sel.Resolver 'DoH: an HTML block page counts as blocked'
+
+    Reset-FakeHttp
+    $script:FakeHttp['cloudflare-dns.com'] = [pscustomobject]@{ StatusCode = 403; Body = 'Forbidden'; Error = $null }
+    $script:FakeHttp['dns.google'] = $blocked
+    $sel = Select-DnsResolver -Preferred 'Cloudflare'
+    Assert-True (-not $sel.Ok) 'DoH: both blocked is reported as failure'
+    Assert-True ($sel.Message -match 'HTTP 403' -and $sel.Message -match 'dns\.google' -and $sel.Message -match 'allow cloudflare-dns\.com or dns\.google') 'DoH: failure message explains both errors and the fix'
+
+    # Mid-run: the active resolver stops answering, the next query moves to the other one, once.
+    Reset-FakeHttp
+    [void](Select-DnsResolver -Preferred 'Cloudflare')
+    $script:FakeHttp['cloudflare-dns.com'] = $blocked
+    $script:FakeHttp['dns.google'] = { param($Uri) New-DohAnswer }
+    $r = Resolve-Doh -Name 'midrun.test' -Type 'A' 6> $null
+    Assert-True ($r.Ok -and $r.Records[0] -eq '192.0.2.1') 'DoH: query succeeds after switching mid-run'
+    Assert-Equal 'Google' $script:ActiveResolver 'DoH: stays on the fallback resolver'
+    Assert-True ($script:ResolverNote -match 'stopped answering') 'DoH: mid-run switch is noted'
+    $script:FakeHttpCalls.Clear()
+    $script:FakeHttp['dns.google'] = $blocked
+    $r = Resolve-Doh -Name 'midrun2.test' -Type 'A' 6> $null
+    Assert-True (-not $r.Ok -and $r.Error -match 'No such host') 'DoH: when both fail mid-run the lookup fails instead of looping'
+    Assert-Equal 2 $script:FakeHttpCalls.Count 'DoH: no switching back and forth'
+
+    # A SERVFAIL comes from the domain's own DNS, not the resolver: no switch.
+    Reset-FakeHttp
+    [void](Select-DnsResolver -Preferred 'Cloudflare')
+    $script:FakeHttp['cloudflare-dns.com'] = { param($Uri) New-DohAnswer -Status 2 }
+    $r = Resolve-Doh -Name 'servfail.test' -Type 'A' 6> $null
+    Assert-True (-not $r.Ok -and $r.Error -match 'SERVFAIL') 'DoH: SERVFAIL is reported as a lookup error'
+    Assert-Equal 'Cloudflare' $script:ActiveResolver 'DoH: SERVFAIL does not switch resolvers'
+
+    # Full run with Cloudflare blocked: report says which resolver was used.
+    Reset-FakeHttp
+    $script:FakeHttp['cloudflare-dns.com'] = $blocked
+    $run = Invoke-ClientDomainCheck 6> $null
+    Assert-True ($run -isnot [int] -and $run.ExitCode -eq 0) 'DoH: run with fallback completes normally'
+    $html = [IO.File]::ReadAllText($run.ReportPath)
+    Assert-True ($html -match 'DNS over HTTPS \(Google; Cloudflare couldn&#39;t be reached\)' -or $html -match "DNS over HTTPS \(Google; Cloudflare couldn't be reached\)") 'DoH: report footer names the fallback'
+
+    # Full run with both blocked: exit 3, no report, and the webhook hears about it.
+    Reset-FakeHttp
+    $script:FakeHttp['cloudflare-dns.com'] = $blocked
+    $script:FakeHttp['dns.google'] = $blocked
+    $script:Posts.Clear()
+    $before = @(Get-ChildItem -LiteralPath $OutputFolder -Filter '*.html').Count
+    $WebhookUrl = 'https://hooks.slack.com/services/T/B/X'
+    $run = Invoke-ClientDomainCheck 6> $null
+    Assert-Equal 3 $run 'DoH: exit code 3 when DNS over HTTPS is unreachable'
+    Assert-Equal $before @(Get-ChildItem -LiteralPath $OutputFolder -Filter '*.html').Count 'DoH: no misleading report when nothing could be checked'
+    Assert-Equal 1 $script:Posts.Count 'DoH: failure is posted to the webhook even without -NotifyAlways'
+    $msg = ($script:Posts[0].Json | ConvertFrom-Json).text
+    Assert-True ($msg -match "^:warning: \*Client domain check couldn't run on " -and $msg -match 'allow cloudflare-dns\.com') 'Slack: failure message'
+
+    $WebhookUrl = 'https://prod-00.westus.logic.azure.com/workflows/x'
+    $script:Posts.Clear()
+    $run = Invoke-ClientDomainCheck 6> $null
+    $card = $script:Posts[0].Json | ConvertFrom-Json
+    Assert-True ($card.type -eq 'message' -and $card.attachments[0].content.body[0].text -match "couldn't run" -and $card.attachments[0].content.body[1].text -match 'encrypted DNS') 'Teams: failure card'
+
+    # An empty list is reported the same way.
+    $script:Posts.Clear()
+    $empty = Join-Path $tmp 'empty.txt'
+    Set-Content -LiteralPath $empty -Value @('# nothing yet')
+    $InputFile = $empty
+    $run = Invoke-ClientDomainCheck 6> $null
+    Assert-Equal 3 $run 'Empty list: exit code 3'
+    Assert-True ($script:Posts.Count -eq 1 -and $script:Posts[0].Json -match 'domain list is empty') 'Empty list: posted to the webhook'
+    $WebhookUrl = $null
+    Reset-FakeHttp
 }
 finally {
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue

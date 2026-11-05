@@ -17,10 +17,12 @@
 
     It writes an HTML report and a CSV, can post a summary to Microsoft Teams or
     Slack, and exits with 0 (all clear), 1 (warnings) or 2 (critical) so an RMM or
-    Task Scheduler can alert on it.
+    Task Scheduler can alert on it. Exit code 3 means it couldn't run (an empty or
+    unreadable list, or no access to DNS over HTTPS); that is posted to the webhook too.
 
-    Read-only. It sends DNS queries over HTTPS (Cloudflare by default), queries the
-    registries' public RDAP servers, and opens a TLS connection to each website.
+    Read-only. It sends DNS queries over HTTPS (Cloudflare by default, Google if
+    Cloudflare can't be reached), queries the registries' public RDAP servers, and
+    opens a TLS connection to each website.
     It needs no credentials, modules or admin rights, and runs in Windows
     PowerShell 5.1 and PowerShell 7+.
 
@@ -76,8 +78,13 @@ param(
     [switch]$PassThru
 )
 
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.1.0'
 $script:DnsCache = @{}
+$script:ActiveResolver = $DnsResolver
+$script:ResolverSwitched = $false
+$script:ResolverNote = $null
+$script:DohProbeName = 'example.com'
+$script:HttpRetryLog = New-Object System.Collections.Generic.List[string]
 $script:RdapBootstrap = $null
 $script:RdapBootstrapError = $null
 $script:Http = $null
@@ -219,6 +226,7 @@ function Invoke-HttpGet {
             $code = [int]$response.StatusCode
             $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
             if (($code -eq 429 -or $code -ge 500) -and $attempt -lt 3) {
+                $script:HttpRetryLog.Add(("{0} HTTP {1}" -f ([Uri]$Uri).Host, $code)) | Out-Null
                 $retryAfter = 2 * $attempt
                 if ($response.Headers.RetryAfter -and $response.Headers.RetryAfter.Delta) {
                     $retryAfter = [Math]::Max(1, [Math]::Min(30, [int]$response.Headers.RetryAfter.Delta.Value.TotalSeconds))
@@ -229,7 +237,10 @@ function Invoke-HttpGet {
             }
         }
         catch {
-            if ($attempt -lt 3) { $retryAfter = $attempt }
+            if ($attempt -lt 3) {
+                $script:HttpRetryLog.Add(("{0} {1}" -f ([Uri]$Uri).Host, (Get-InnermostMessage $_.Exception))) | Out-Null
+                $retryAfter = $attempt
+            }
             else { $result = [pscustomobject]@{ StatusCode = 0; Body = $null; Error = (Get-InnermostMessage $_.Exception) } }
         }
         finally { $request.Dispose() }
@@ -287,6 +298,74 @@ function Get-RcodeName {
     switch ($Code) { 0 { 'NOERROR' } 1 { 'FORMERR' } 2 { 'SERVFAIL' } 3 { 'NXDOMAIN' } 5 { 'REFUSED' } default { "RCODE $Code" } }
 }
 
+function Get-DohHost {
+    param([string]$Resolver)
+    if ($Resolver -eq 'Google') { return 'dns.google' }
+    'cloudflare-dns.com'
+}
+
+function Get-OtherResolver {
+    param([string]$Resolver)
+    if ($Resolver -eq 'Google') { return 'Cloudflare' }
+    'Google'
+}
+
+function Get-DohUri {
+    param([string]$Resolver, [string]$Name, [string]$Type)
+    $escaped = [Uri]::EscapeDataString($Name)
+    if ($Resolver -eq 'Google') { return "https://dns.google/resolve?name=$escaped&type=$Type" }
+    "https://cloudflare-dns.com/dns-query?name=$escaped&type=$Type"
+}
+
+function Read-DohResponse {
+    # Turns an HTTP response into a DNS answer, or an error when the resolver can't be
+    # used: connection failures, HTTP errors, and block pages from DNS filters or proxies.
+    param($Response)
+    if ($Response.Error) { return [pscustomobject]@{ Json = $null; Error = ([string]$Response.Error).TrimEnd('.', '"', ' ') } }
+    if ($Response.StatusCode -ne 200) { return [pscustomobject]@{ Json = $null; Error = "HTTP $($Response.StatusCode)" } }
+    $json = $null
+    try { $json = $Response.Body | ConvertFrom-Json } catch { $json = $null }
+    if ($null -eq $json -or $json -is [string] -or -not $json.PSObject.Properties['Status']) {
+        return [pscustomobject]@{ Json = $null; Error = 'the reply was not a DNS answer (a filter or proxy may have replaced it)' }
+    }
+    [pscustomobject]@{ Json = $json; Error = $null }
+}
+
+function Select-DnsResolver {
+    # Called once per run: use the preferred resolver if it answers, otherwise the other one.
+    param([string]$Preferred)
+    $script:ResolverSwitched = $false
+    $script:ResolverNote = $null
+    $errors = [ordered]@{}
+    foreach ($r in @($Preferred, (Get-OtherResolver $Preferred))) {
+        $reply = Read-DohResponse (Invoke-HttpGet -Uri (Get-DohUri $r $script:DohProbeName 'A') -Accept 'application/dns-json')
+        if (-not $reply.Error) {
+            $script:ActiveResolver = $r
+            if ($r -ne $Preferred) {
+                $script:ResolverSwitched = $true
+                $script:ResolverNote = "$Preferred DNS ($(Get-DohHost $Preferred)) can't be reached from this machine ($($errors[$Preferred])), so $r was used instead."
+            }
+            return [pscustomobject]@{ Ok = $true; Resolver = $r; Note = $script:ResolverNote; Message = $null }
+        }
+        $errors[$r] = $reply.Error
+    }
+    $detail = (@($errors.Keys) | ForEach-Object { "$_ ($(Get-DohHost $_)): $($errors[$_])" }) -join '; '
+    $message = "This machine can't reach DNS over HTTPS at Cloudflare or Google, so no domains were checked. $detail. A DNS filter, firewall or proxy is probably blocking encrypted DNS: allow cloudflare-dns.com or dns.google for this machine, or run the check from another machine."
+    [pscustomobject]@{ Ok = $false; Resolver = $null; Note = $null; Message = $message }
+}
+
+function Switch-DnsResolver {
+    # Called when the active resolver stops answering mid-run. Switches once, never back.
+    param([string]$Reason)
+    if ($script:ResolverSwitched) { return $false }
+    $from = $script:ActiveResolver
+    $script:ActiveResolver = Get-OtherResolver $from
+    $script:ResolverSwitched = $true
+    $script:ResolverNote = "$from DNS ($(Get-DohHost $from)) stopped answering ($Reason), so $($script:ActiveResolver) was used for the rest of the run."
+    Write-Host "  Note: $($script:ResolverNote)" -ForegroundColor Yellow
+    $true
+}
+
 function Resolve-Doh {
     param(
         [string]$Name,
@@ -296,19 +375,20 @@ function Resolve-Doh {
     if ($script:DnsCache.ContainsKey($key)) { return $script:DnsCache[$key] }
 
     $typeNumber = @{ A = 1; NS = 2; CNAME = 5; MX = 15; TXT = 16; AAAA = 28 }[$Type]
-    $escaped = [Uri]::EscapeDataString($Name)
-    if ($DnsResolver -eq 'Google') { $uri = "https://dns.google/resolve?name=$escaped&type=$Type" }
-    else { $uri = "https://cloudflare-dns.com/dns-query?name=$escaped&type=$Type" }
-
     $result = [pscustomobject]@{ Name = $Name; Type = $Type; Ok = $false; Status = $null; Records = @(); Cnames = @(); Error = $null }
-    for ($try = 1; $try -le 2; $try++) {
-        $response = Invoke-HttpGet -Uri $uri -Accept 'application/dns-json'
-        if ($response.Error) { $result.Error = "DNS query failed: $($response.Error)"; continue }
-        if ($response.StatusCode -ne 200) { $result.Error = "DNS query failed: HTTP $($response.StatusCode)"; continue }
-        try { $json = $response.Body | ConvertFrom-Json }
-        catch { $result.Error = 'DNS query failed: unreadable response'; continue }
+    $try = 0
+    while ($try -lt 2) {
+        $try++
+        $reply = Read-DohResponse (Invoke-HttpGet -Uri (Get-DohUri $script:ActiveResolver $Name $Type) -Accept 'application/dns-json')
+        if ($reply.Error) {
+            $result.Error = "DNS query failed: $($reply.Error)"
+            if (Switch-DnsResolver -Reason $reply.Error) { $try = 0 }   # retry on the other resolver
+            continue
+        }
+        $json = $reply.Json
         $result.Status = [int]$json.Status
         if ($result.Status -ne 0 -and $result.Status -ne 3) {
+            # SERVFAIL and similar come from the domain's own DNS, so don't switch resolvers.
             $result.Error = "DNS lookup returned $(Get-RcodeName $result.Status)"
             continue
         }
@@ -1336,6 +1416,51 @@ function New-WebhookPayload {
     ConvertTo-Json -InputObject $card -Depth 12 -Compress
 }
 
+function New-FailurePayload {
+    # Posted when the check couldn't run at all, so a scheduled run never fails silently.
+    param([string]$Url, [string]$Message)
+    $title = "Client domain check couldn't run on $([Environment]::MachineName)"
+    if ($Url -match '^https://hooks\.slack\.com/') {
+        $safe = ($Message -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;')
+        return (ConvertTo-Json -InputObject @{ text = ":warning: *$title*`n$safe" } -Depth 3 -Compress)
+    }
+    $card = [ordered]@{
+        type        = 'message'
+        attachments = @(
+            [ordered]@{
+                contentType = 'application/vnd.microsoft.card.adaptive'
+                contentUrl  = $null
+                content     = [ordered]@{
+                    '$schema' = 'http://adaptivecards.io/schemas/adaptive-card.json'
+                    type      = 'AdaptiveCard'
+                    version   = '1.4'
+                    msteams   = @{ width = 'Full' }
+                    body      = @(
+                        [ordered]@{ type = 'TextBlock'; text = $title; weight = 'Bolder'; size = 'Medium'; color = 'Attention'; wrap = $true },
+                        [ordered]@{ type = 'TextBlock'; text = $Message; wrap = $true }
+                    )
+                }
+            }
+        )
+    }
+    ConvertTo-Json -InputObject $card -Depth 12 -Compress
+}
+
+function Stop-Run {
+    # Reports a run that couldn't check anything and returns exit code 3.
+    param([string]$Message)
+    Write-Host "ERROR: $Message" -ForegroundColor Red
+    if ($WebhookUrl) {
+        if (-not $script:Http) { Initialize-Http }
+        $post = Invoke-HttpPostJson -Uri $WebhookUrl -Json (New-FailurePayload -Url $WebhookUrl -Message $Message)
+        if ($post.Error -or $post.StatusCode -lt 200 -or $post.StatusCode -ge 300) {
+            Write-Warning "Posting the error to the webhook failed too: $(if ($post.Error) { $post.Error } else { 'HTTP ' + $post.StatusCode })"
+        }
+        else { Write-Host 'Error posted to the webhook.' }
+    }
+    [int]3
+}
+
 # ---------------------------------------------------------------- main
 
 function Invoke-ClientDomainCheck {
@@ -1349,12 +1474,15 @@ function Invoke-ClientDomainCheck {
     if (-not $outDir) { $outDir = Join-Path $base 'reports' }
     $outDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($outDir)
 
-    try { $entries = @(Read-DomainList -Path $listPath -Names $Domain) }
-    catch { Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red; return [int]3 }
-    if ($entries.Count -eq 0) { Write-Host 'ERROR: the domain list is empty.' -ForegroundColor Red; return [int]3 }
-    if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
-
     Initialize-Http
+    try { $entries = @(Read-DomainList -Path $listPath -Names $Domain) }
+    catch { return (Stop-Run $_.Exception.Message) }
+    if ($entries.Count -eq 0) { return (Stop-Run 'The domain list is empty.') }
+
+    $dns = Select-DnsResolver -Preferred $DnsResolver
+    if (-not $dns.Ok) { return (Stop-Run $dns.Message) }
+    if ($dns.Note) { Write-Host "Note: $($dns.Note)" -ForegroundColor Yellow }
+    if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
     $statePath = Join-Path $outDir 'domain-check-state.json'
     $previous = Read-State -Path $statePath
 
@@ -1378,7 +1506,9 @@ function Invoke-ClientDomainCheck {
     $stamp = $started.ToString('yyyy-MM-dd-HHmm', [Globalization.CultureInfo]::InvariantCulture)
     $htmlPath = Join-Path $outDir "domain-check-$stamp.html"
     $csvPath = Join-Path $outDir "domain-check-$stamp.csv"
-    $html = New-HtmlReport -Results $sorted -Started $started -ResolverName $DnsResolver
+    $resolverLabel = $script:ActiveResolver
+    if ($script:ResolverSwitched) { $resolverLabel = "$($script:ActiveResolver); $(Get-OtherResolver $script:ActiveResolver) couldn't be reached" }
+    $html = New-HtmlReport -Results $sorted -Started $started -ResolverName $resolverLabel
     [System.IO.File]::WriteAllText($htmlPath, $html, (New-Object System.Text.UTF8Encoding($false)))
     $csvEncoding = 'UTF8'
     if ($PSVersionTable.PSEdition -eq 'Core') { $csvEncoding = 'utf8BOM' }   # so Excel reads accented names correctly
@@ -1391,6 +1521,7 @@ function Invoke-ClientDomainCheck {
     $ok = $sorted.Count - $critical - $warning
     Write-Host ''
     Write-Host ("{0} critical, {1} warning, {2} OK" -f $critical, $warning, $ok)
+    if ($script:ResolverNote) { Write-Host "Note: $($script:ResolverNote)" -ForegroundColor Yellow }
     $attention = Get-AttentionLines -Results $sorted -Max 1000
     foreach ($l in $attention.Lines) {
         $color = 'Yellow'

@@ -2,10 +2,41 @@
 # Dot-source the main script first, then this file.
 
 $script:NetworkCalls = New-Object System.Collections.Generic.List[string]
+$script:FakeHttpCalls = New-Object System.Collections.Generic.List[string]
+$script:Posts = New-Object System.Collections.Generic.List[object]
+
+# Fake HTTP responses by host name: a pscustomobject (StatusCode, Body, Error) or a
+# scriptblock that receives the URI. By default both DNS-over-HTTPS resolvers answer the
+# start-of-run reachability probe, and everything else is "network disabled".
+$script:FakeHttp = @{}
+function New-DohAnswer {
+    param([int]$Status = 0)
+    [pscustomobject]@{ StatusCode = 200; Body = ('{"Status":' + $Status + ',"Answer":[{"name":"example.com.","type":1,"TTL":300,"data":"192.0.2.1"}]}'); Error = $null }
+}
+function Reset-FakeHttp {
+    $script:FakeHttp = @{}
+    $probe = { param($Uri) if ($Uri -match ('[?&]name=' + [regex]::Escape($script:DohProbeName) + '&')) { New-DohAnswer } else { $null } }
+    $script:FakeHttp['cloudflare-dns.com'] = $probe
+    $script:FakeHttp['dns.google'] = $probe
+    $script:FakeHttpCalls.Clear()
+}
+Reset-FakeHttp
+
 function Invoke-HttpGet {
     param([string]$Uri, [string]$Accept)
+    $hostName = ([Uri]$Uri).Host
+    if ($script:FakeHttp.ContainsKey($hostName)) {
+        $fake = $script:FakeHttp[$hostName]
+        if ($fake -is [scriptblock]) { $fake = & $fake $Uri }
+        if ($null -ne $fake) { $script:FakeHttpCalls.Add($Uri) | Out-Null; return $fake }
+    }
     $script:NetworkCalls.Add($Uri) | Out-Null
     [pscustomobject]@{ StatusCode = 0; Body = $null; Error = 'network disabled in offline tests' }
+}
+function Invoke-HttpPostJson {
+    param([string]$Uri, [string]$Json)
+    $script:Posts.Add([pscustomobject]@{ Uri = $Uri; Json = $Json }) | Out-Null
+    [pscustomobject]@{ StatusCode = 200; Body = 'ok'; Error = $null }
 }
 
 function Set-Dns {
